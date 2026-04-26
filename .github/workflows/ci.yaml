@@ -1,0 +1,118 @@
+name: CI - Frontend
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - develop
+
+env:
+  APP_NAME: productcatalog
+  REGISTRY: ghcr.io/emmexgdc
+  GITOPS_REPO: emmexgdc/homelab-gitops
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gitops-productcatalog-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Environment
+        id: env
+        run: |
+          if [[ "${GITHUB_REF##*/}" == "main" ]]; then
+            echo "env=prod" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF##*/}" == "staging" ]]; then
+            echo "env=staging" >> $GITHUB_OUTPUT
+          else
+            echo "env=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set Image Tag
+        id: tag
+        run: echo "tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Login to GHCR
+        run: echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build Image
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ steps.tag.outputs.tag }} \
+            -t ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ steps.env.outputs.env }}-latest \
+            .
+
+      - name: Download Trivy HTML Template
+        run: |
+          curl -sfL -o trivy-html.tpl \
+            https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl
+
+      - name: Run Trivy Scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ steps.tag.outputs.tag }}
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+          exit-code: '0'
+          format: template
+          template: '@trivy-html.tpl'
+          output: trivy-report.html
+          ignore-unfixed: true
+
+      - name: Upload Trivy Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report-${{ steps.tag.outputs.tag }}
+          path: trivy-report.html
+
+      - name: Push Image
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ steps.tag.outputs.tag }}
+          docker push ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ steps.env.outputs.env }}-latest
+
+      - name: Checkout GitOps Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Install Kustomize
+        run: |
+          curl -sLo kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.3.0/kustomize_v5.3.0_linux_amd64.tar.gz
+          tar -xzf kustomize.tar.gz
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Update GitOps Image Tag
+        run: |
+          cd gitops/apps/${{ env.APP_NAME }}/overlays/${{ steps.env.outputs.env }}
+          kustomize edit set image ${{ env.APP_NAME }}=${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ steps.tag.outputs.tag }}
+
+      - name: Commit and Push
+        run: |
+          cd gitops
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "${{ env.APP_NAME }} → ${{ steps.env.outputs.env }} → ${{ steps.tag.outputs.tag }}"
+            git push
+          fi
